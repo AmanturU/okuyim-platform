@@ -4,16 +4,36 @@ const bcrypt = require("bcryptjs");
 const dotenv = require("dotenv");
 const fs = require("fs").promises;
 const path = require("path");
+const rateLimit = require("express-rate-limit");
+const {
+  generateToken,
+  verifyToken,
+  requireAdmin,
+  requireOwnership,
+} = require("./middleware/auth");
+const database = require("./config/database");
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Подключение к БД
+database.connect();
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static("public"));
+
+// Rate limiting защита
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 минут
+  max: 100, // максимум 100 запросов
+  message: { error: "Слишком много запросов. Попробуйте позже." },
+});
+
+app.use("/api/", limiter);
 
 // Пути к файлам данных
 const DATA_DIR = path.join(__dirname, "data");
@@ -370,8 +390,13 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Неверный пароль" });
     }
 
+    const token = generateToken(user);
     const { password: _, ...userWithoutPassword } = user;
-    res.json({ user: userWithoutPassword });
+
+    res.json({
+      user: userWithoutPassword,
+      token,
+    });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Ошибка сервера" });
@@ -386,7 +411,7 @@ app.post("/api/auth/logout", async (req, res) => {
 });
 
 // -------------------- SCENARIO ROUTES --------------------
-app.get("/api/scenarios", async (req, res) => {
+app.get("/api/scenarios", verifyToken, async (req, res) => {
   try {
     const scenarios = await readScenarios();
     res.json(scenarios);
@@ -395,7 +420,7 @@ app.get("/api/scenarios", async (req, res) => {
   }
 });
 
-app.get("/api/scenarios/:id", async (req, res) => {
+app.get("/api/scenarios/:id", verifyToken, async (req, res) => {
   try {
     const scenarios = await readScenarios();
     const scenario = scenarios.find((s) => s.id === parseInt(req.params.id));
@@ -409,7 +434,7 @@ app.get("/api/scenarios/:id", async (req, res) => {
 });
 
 // -------------------- SIMULATION ROUTES --------------------
-app.post("/api/simulations", async (req, res) => {
+app.post("/api/simulations", verifyToken, async (req, res) => {
   const { userId, scenarioId } = req.body;
 
   try {
@@ -473,7 +498,7 @@ app.post("/api/simulations", async (req, res) => {
   }
 });
 
-app.get("/api/simulations/user/:userId", async (req, res) => {
+app.get("/api/simulations/user/:userId", verifyToken, async (req, res) => {
   try {
     const simulations = await readSimulations();
     const userSimulations = simulations.filter(
@@ -485,7 +510,7 @@ app.get("/api/simulations/user/:userId", async (req, res) => {
   }
 });
 
-app.get("/api/simulations/:id", async (req, res) => {
+app.get("/api/simulations/:id", verifyToken, async (req, res) => {
   try {
     const simulations = await readSimulations();
     const simulation = simulations.find(
@@ -500,7 +525,7 @@ app.get("/api/simulations/:id", async (req, res) => {
   }
 });
 
-app.put("/api/simulations/:id/tasks/:taskId", async (req, res) => {
+app.put("/api/simulations/:id/tasks/:taskId", verifyToken, async (req, res) => {
   try {
     const simulations = await readSimulations();
     const simulationIndex = simulations.findIndex(
@@ -824,7 +849,7 @@ function generateDetailedRecommendations(simulation, scenario) {
   return { recommendations, summary };
 }
 
-app.post("/api/simulations/:id/nextDay", async (req, res) => {
+app.post("/api/simulations/:id/nextDay", verifyToken, async (req, res) => {
   try {
     const simulations = await readSimulations();
     const simulationIndex = simulations.findIndex(
@@ -1081,7 +1106,7 @@ app.post("/api/simulations/:id/nextDay", async (req, res) => {
   }
 });
 
-app.post("/api/simulations/:id/complete", async (req, res) => {
+app.post("/api/simulations/:id/complete", verifyToken, async (req, res) => {
   try {
     const simulations = await readSimulations();
     const simulationIndex = simulations.findIndex(
@@ -1141,8 +1166,68 @@ app.post("/api/simulations/:id/complete", async (req, res) => {
   }
 });
 
+// Добавьте этот код в server.js после других маршрутов
+app.get("/api/leaderboard", verifyToken, async (req, res) => {
+  try {
+    const simulations = await readSimulations();
+    const users = await readUsers();
+    const period = req.query.period || "all";
+
+    let filteredSims = simulations.filter((s) => s.status === "completed");
+
+    // Фильтр по периоду
+    if (period === "week") {
+      const weekAgo = new Date();
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      filteredSims = filteredSims.filter(
+        (s) => new Date(s.completedAt) > weekAgo,
+      );
+    } else if (period === "month") {
+      const monthAgo = new Date();
+      monthAgo.setMonth(monthAgo.getMonth() - 1);
+      filteredSims = filteredSims.filter(
+        (s) => new Date(s.completedAt) > monthAgo,
+      );
+    }
+
+    // Подсчёт очков
+    const leaderboard = users
+      .filter((u) => u.role !== "admin")
+      .map((user) => {
+        const userSims = filteredSims.filter((s) => s.userId === user.id);
+        const totalScore = userSims.reduce((sum, sim) => {
+          const metrics = sim.finalMetrics || {};
+          const score = Math.round(
+            (metrics.finalSatisfaction || 0) * 0.4 +
+              (100 - Math.min(100, Math.abs(metrics.budgetVariance || 0))) *
+                0.3 +
+              (100 - Math.min(100, Math.abs(metrics.timeVariance || 0))) * 0.3,
+          );
+          return sum + score;
+        }, 0);
+
+        return {
+          id: user.id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          totalScore,
+          completedProjects: userSims.length,
+          avgScore:
+            userSims.length > 0 ? Math.round(totalScore / userSims.length) : 0,
+        };
+      })
+      .filter((u) => u.completedProjects > 0)
+      .sort((a, b) => b.totalScore - a.totalScore);
+
+    res.json(leaderboard);
+  } catch (error) {
+    console.error("Leaderboard error:", error);
+    res.status(500).json({ error: "Ошибка загрузки рейтинга" });
+  }
+});
+
 // -------------------- ADMIN ROUTES --------------------
-app.get("/api/admin/users", async (req, res) => {
+app.get("/api/admin/users", verifyToken, requireAdmin, async (req, res) => {
   try {
     const users = await readUsers();
     const usersWithoutPasswords = users.map(({ password, ...user }) => user);
@@ -1152,7 +1237,7 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
-app.get("/api/admin/stats", async (req, res) => {
+app.get("/api/admin/stats", verifyToken, requireAdmin, async (req, res) => {
   try {
     const users = await readUsers();
     const simulations = await readSimulations();
